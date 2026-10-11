@@ -21,6 +21,10 @@
 关掉悬浮条只是隐藏，程序仍在托盘运行；托盘菜单里"退出"才真正结束。
 
 【唯一实例】重复启动不会再开一个托盘图标，只会把已在运行那个实例的悬浮条叫出来。
+
+【线程模型】DDC/CI 是毫秒级慢速 I/O，显示器无响应时可能阻塞数秒，
+所有调节都丢给 ddc_worker 后台线程执行，Tk 主线程只改界面和投递请求，
+拖动停止 100ms 后才真正应用（去抖），保证界面和退出永不卡死。
 """
 import ctypes
 import json
@@ -49,6 +53,7 @@ DEFAULT_CFG_HEADER = (
 )
 HOTKEY_STEP = 5
 IDLE_LIMIT = 10          # 秒：无操作自动隐藏
+COMMIT_DELAY_MS = 100    # 去抖：停止调节这么久后才把最终值交给后台线程
 
 MUTEX_NAME = "Local\\SancBrightnessWidget.single"
 WAKEUP_NAME = "Local\\SancBrightnessWidget.wakeup"
@@ -163,6 +168,35 @@ def read_current():
     return val
 
 
+def ddc_worker(cmd_q, out_q, stop_event):
+    """后台线程：所有 DDC/CI 慢速 I/O 都在这里做，绝不碰 Tk 主线程。
+
+    拖动滑块会连续投递请求，这里只执行最新的一个值（旧值直接丢弃），
+    避免显示器被排队请求"回放"一遍。应用完回读一次实际亮度发回 UI 校正。
+    """
+    while not stop_event.is_set():
+        try:
+            item = cmd_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        latest = item
+        while True:
+            try:
+                nxt = cmd_q.get_nowait()
+            except queue.Empty:
+                break
+            latest = nxt
+        if latest[0] != "apply":
+            continue
+        requested = latest[1]
+        try:
+            apply_all(requested)
+            actual = read_current()
+        except Exception:
+            actual = None
+        out_q.put(("value", requested, actual))
+
+
 def pythonw_path():
     exe = sys.executable
     if exe.lower().endswith("python.exe"):
@@ -270,7 +304,6 @@ class BrightnessBar:
         self.tid = None
         self._drag = (0, 0)
         self._mode = None          # None / "slider" / "window"：按下时确定，整个拖动过程不变
-        self._last_sent = None
         self._toast_job = None
         self._lock_hint = False
         self._hover = False
@@ -279,15 +312,17 @@ class BrightnessBar:
         self.tray = None
 
         self.default = read_default_value()
-        # 启动即把亮度设成 brightness.txt 里的默认值。
+        # 启动即把亮度设成 brightness.txt 里的默认值。这个应用动作由
+        # ddc_worker 在后台做（显示器无响应时同步调用曾把整个程序卡死），
+        # 主线程先显示默认值，worker 应用完回读实际值再校正。
         # 配合开机自启，这就是"开机亮度"。
-        apply_all(self.default)
-        self.value = read_current()
-        if self.value is None:
-            self.value = self.default
+        self.value = self.default
         self.locked = bool(self.state.get("locked", True))
 
+        self._commit_job = None
+        self.ddc_q = queue.Queue()
         self._build_ui()
+        self._start_ddc_worker()
         self._start_hotkeys()
         self._start_tray()
         self._poll()
@@ -527,12 +562,30 @@ class BrightnessBar:
             self.value = v
             self._redraw_slider()
             self.cv.itemconfigure(self._value_item, text=str(v))
-            if self._last_sent != v:
-                self._last_sent = v
-                apply_all(v)
+            self._schedule_commit()
         if self.tray:
             self.tray.set_value(v)
         self.poke()
+
+    def _schedule_commit(self):
+        """去抖：连续拖动/滚轮只在停止 100ms 后把最终值交给 ddc_worker。"""
+        if self._commit_job:
+            self.root.after_cancel(self._commit_job)
+        self._commit_job = self.root.after(COMMIT_DELAY_MS, self._commit)
+
+    def _commit(self):
+        self._commit_job = None
+        self.ddc_q.put(("apply", self.value))
+
+    def _accept_actual(self, requested, actual):
+        """ddc_worker 应用完回读的实际亮度。仅当用户此后没再改动时才校正显示。"""
+        if actual is None or actual == self.value or self.value != requested:
+            return
+        self.value = actual
+        self._redraw_slider()
+        self.cv.itemconfigure(self._value_item, text=str(actual))
+        if self.tray:
+            self.tray.set_value(actual)
 
     def nudge(self, d):
         if self.root.state() == "withdrawn":
@@ -590,6 +643,12 @@ class BrightnessBar:
         if not self.tray.start():
             self.tray = None
 
+    def _start_ddc_worker(self):
+        threading.Thread(target=ddc_worker,
+                         args=(self.ddc_q, self.q, self.stop_event),
+                         daemon=True).start()
+        self.ddc_q.put(("apply", self.default))
+
     def _start_hotkeys(self):
         threading.Thread(target=hotkey_worker,
                          args=(self.q, self.stop_event), daemon=True).start()
@@ -608,6 +667,8 @@ class BrightnessBar:
                         self.toast("全局热键被占用")
                 elif k == "step":
                     self.nudge(item[1])
+                elif k == "value":
+                    self._accept_actual(item[1], item[2])
                 elif k == "toggle_bar":
                     self.toggle_bar()
                 elif k == "set_default":
