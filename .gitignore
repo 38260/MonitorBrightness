@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# 运行时自己写的状态：悬浮条坐标、锁定、显隐
+widget_state.json
+
+# 各人自己的默认亮度，不入库
+brightness.txt
+
+# 快捷方式里是本机绝对路径
+*.lnk
+brightness.ico
