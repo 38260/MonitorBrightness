@@ -98,6 +98,10 @@ k32.CloseHandle.argtypes = [wintypes.HANDLE]
 k32.WaitForSingleObject.restype = wintypes.DWORD
 k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 
+# 热键线程需要的最小 User32 面：模块句柄用于 RegisterClass/CreateWindow。
+k32.GetModuleHandleW.restype = wintypes.HANDLE
+k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
 # 设计稿尺寸（逻辑像素，运行时按 DPI 缩放）
 D_W, D_H = 384, 54
 D_SL_X1, D_SL_X2 = 58, 250
@@ -251,36 +255,126 @@ def dpi_scale():
         return 1.0
 
 
+HOTKEY_CLASS = "SancBrightnessHotkeyWnd"
+HOTKEY_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+
 def hotkey_worker(q, stop_event):
+    """全局热键线程。
+
+    【为什么必须有自己的隐藏窗口】
+    之前这里用 `GetMessageW(..., None, 0, 0)` 抓整个线程的消息。Win32 规定：
+    窗口消息由「最早调用 GetMessage 的线程」处理，而窗口过程会在那个线程上执行。
+    本进程内 tray 图标窗口与 Tk 窗口同属一个进程，热键线程一旦抢先取走它们的
+    窗口消息，tray 的 WndProc（内部含 TrackPopupMenu 模态循环）就会跑在热键线程上，
+    与 Tk 主循环争抢消息、互相阻塞 —— 表现就是界面整窗卡死、点 × 也关不掉。
+
+    现在改成：本线程注册专属窗口类并创建一个隐藏窗口，RegisterHotKey 把热键
+    投递到该窗口，GetMessageW 也只取本窗口的消息。窗口消息永不跨线程，
+    从结构上杜绝了上面那条死锁路径。
+    """
     u = ctypes.WinDLL("user32", use_last_error=True)
     k = ctypes.WinDLL("kernel32", use_last_error=True)
     u.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
     u.RegisterHotKey.restype = wintypes.BOOL
     u.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    u.UnregisterHotKey.restype = wintypes.BOOL
     u.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
                               ctypes.c_uint, ctypes.c_uint]
     u.GetMessageW.restype = ctypes.c_int
     u.PostThreadMessageW.argtypes = [wintypes.DWORD, ctypes.c_uint,
                                      wintypes.WPARAM, wintypes.LPARAM]
+    u.RegisterClassW.argtypes = [ctypes.c_void_p]
+    u.RegisterClassW.restype = wintypes.WORD
+    u.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                  wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                  wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    u.CreateWindowExW.restype = wintypes.HWND
+    u.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                 wintypes.WPARAM, wintypes.LPARAM]
+    u.DefWindowProcW.restype = ctypes.c_ssize_t
+    u.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    u.TranslateMessage.restype = wintypes.BOOL
+    u.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    u.DispatchMessageW.restype = ctypes.c_ssize_t
 
+    class WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", HOTKEY_WNDPROC),
+            ("cbClsExtra", ctypes.c_int),
+            ("cbWndExtra", ctypes.c_int),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HANDLE),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
+    def _wndproc(hwnd, msg, wparam, lparam):
+        # 热键通知由系统投递，这里只做分发；其余消息交回默认处理。
+        if msg == WM_HOTKEY:
+            if wparam == HK_UP:
+                q.put(("step", HOTKEY_STEP))
+            elif wparam == HK_DOWN:
+                q.put(("step", -HOTKEY_STEP))
+            return 0
+        return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    wndproc_ref = HOTKEY_WNDPROC(_wndproc)
+    hinst = k.GetModuleHandleW(None)
+
+    # 先把这个线程要用的窗口建起来（只有建了窗口，本线程的消息队列才存在，
+    # PostThreadMessage 才不会因为 "queue 尚未创建" 而丢消息）。
+    wc = WNDCLASSW()
+    wc.lpfnWndProc = wndproc_ref
+    wc.hInstance = hinst
+    wc.lpszClassName = HOTKEY_CLASS
+    if not u.RegisterClassW(ctypes.byref(wc)):
+        # 返回值 0 = 注册失败；唯一正常情形是"类已存在"（ERROR_CLASS_ALREADY_EXISTS
+        # = 1410）。此时窗口仍可正常创建，继续即可；其它错误记下但不致命。
+        if ctypes.get_last_error() != 1410:
+            q.put(("hotkeys", False, False))
+    hwnd = u.CreateWindowExW(0, HOTKEY_CLASS, HOTKEY_CLASS, 0,
+                             0, 0, 0, 0, None, None, hinst, None)
+
+    # 先把线程 id 交出去：即使窗口创建失败，退出时也能用 PostThreadMessage 唤醒。
     q.put(("tid", k.GetCurrentThreadId()))
-    ok_up = bool(u.RegisterHotKey(None, HK_UP, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_UP))
-    ok_dn = bool(u.RegisterHotKey(None, HK_DOWN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_DOWN))
+
+    if not hwnd:
+        q.put(("hotkeys", False, False))
+        return
+
+    ok_up = bool(u.RegisterHotKey(hwnd, HK_UP, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_UP))
+    ok_dn = bool(u.RegisterHotKey(hwnd, HK_DOWN, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_DOWN))
     q.put(("hotkeys", ok_up, ok_dn))
 
+    # 只取本窗口的消息：窗口过程永远在热键线程上执行，不碰 Tk / tray 的窗口消息。
+    # 用 GetMessageW(hwnd) 而非 (None)：前者只取投递到本窗口的消息，
+    # 后者会取走整个线程队列里的窗口消息。
     msg = wintypes.MSG()
-    while not stop_event.is_set():
-        r = u.GetMessageW(ctypes.byref(msg), None, 0, 0)
+    while True:
+        r = u.GetMessageW(ctypes.byref(msg), hwnd, 0, 0)
         if r in (0, -1):
             break
-        if msg.message == WM_HOTKEY:
-            if msg.wParam == HK_UP:
-                q.put(("step", HOTKEY_STEP))
-            elif msg.wParam == HK_DOWN:
-                q.put(("step", -HOTKEY_STEP))
+        try:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            # 单条消息处理失败绝不能终止消息循环，否则热键会永久失效。
+            pass
 
-    u.UnregisterHotKey(None, HK_UP)
-    u.UnregisterHotKey(None, HK_DOWN)
+    # 退出清理：热键与窗口都要销毁，避免反复启动/退出累积内核对象
+    # （窗口类本身注册在进程内，进程退出即释放，无需且不应注销）。
+    u.UnregisterHotKey(hwnd, HK_UP)
+    u.UnregisterHotKey(hwnd, HK_DOWN)
+    try:
+        u.DestroyWindow(hwnd)
+    except Exception:
+        pass
 
 
 def round_rect(cv, x1, y1, x2, y2, r, **kw):
@@ -301,6 +395,9 @@ class BrightnessBar:
         self.wakeup = wakeup
         self.q = queue.Queue()
         self.stop_event = threading.Event()
+        # _running: 轮询/计时器是否还应自续期。quit() 置 False，
+        # 保证 Tk 销毁后不再有任何 after 回调触发（否则抛 TclError 噪音）。
+        self._running = True
         self.tid = None
         self._drag = (0, 0)
         self._mode = None          # None / "slider" / "window"：按下时确定，整个拖动过程不变
@@ -503,6 +600,7 @@ class BrightnessBar:
         items = self.cv.find_withtag("current")
         tags = self.cv.gettags(items[0]) if items else ()
         if "btn" in tags or "value" in tags:
+            self._mode = "button"                     # 标记一下，释放时不刷新空闲计时
             return                                   # 按钮/数字各自处理，不参与拖动
         if "slider" in tags or self._in_slider_zone(e.x, e.y):
             self._mode = "slider"                    # 按下就定死；之后指针滑出去也仍是在调亮度
@@ -526,8 +624,12 @@ class BrightnessBar:
                                        e.y_root - self._drag[1]))
 
     def _release(self, e):
-        self._mode = None
+        mode, self._mode = self._mode, None
         self._lock_hint = False
+        if mode == "button":
+            # 按钮/数字上的释放只是点击收尾，不应该刷新空闲计时，
+            # 否则每次点完 × 之外的按钮都会把自动隐藏再往后推 10 秒。
+            return
         self.poke()
 
     def _dblclick(self, e):
@@ -568,9 +670,17 @@ class BrightnessBar:
         self.poke()
 
     def _schedule_commit(self):
-        """去抖：连续拖动/滚轮只在停止 100ms 后把最终值交给 ddc_worker。"""
-        if self._commit_job:
-            self.root.after_cancel(self._commit_job)
+        """去抖：连续拖动/滚轮只在停止 100ms 后把最终值交给 ddc_worker。
+
+        这里必须容忍 after_cancel 失败：回调可能刚好已经执行（此时 _commit
+        已把 _commit_job 置 None），再去 cancel 会抛 TclError 并让最后一次
+        取值被漏掉。所以用 try/except 包住，无论取消成功与否都重新排一次。
+        """
+        if self._commit_job is not None:
+            try:
+                self.root.after_cancel(self._commit_job)
+            except Exception:
+                pass
         self._commit_job = self.root.after(COMMIT_DELAY_MS, self._commit)
 
     def _commit(self):
@@ -654,40 +764,70 @@ class BrightnessBar:
                          args=(self.q, self.stop_event), daemon=True).start()
 
     def _poll(self):
-        if self.wakeup and k32.WaitForSingleObject(self.wakeup, 0) == WAIT_OBJECT_0:
-            self.show()
+        """事件轮询：把后台线程投递到 q 里的请求搬到 Tk 主线程执行。
+
+        【为什么整体包 try/finally】
+        这个函数靠 `after` 自续期维持轮询链。只要有一次在重排之前抛了异常
+        （队列处理分支里的任何 bug、Tk 对象已销毁、Windows API 临时失败…），
+        `self.root.after(...)` 就不会被执行，轮询链当场断裂 —— 界面还显示着，
+        但再也不处理任何队列消息，托盘/热键全部失灵，用户看到的就是"卡死"。
+        所以这里必须 finally 兜底：无论发生什么，都要把下一次轮询排上。
+        单个请求的处理异常也不能连带整批丢弃，每个请求各自隔离。
+        """
+        if not self._running:
+            return
         try:
+            if self.wakeup and k32.WaitForSingleObject(self.wakeup, 0) == WAIT_OBJECT_0:
+                self.show()
             while True:
-                item = self.q.get_nowait()
-                k = item[0]
-                if k == "tid":
-                    self.tid = item[1]
-                elif k == "hotkeys":
-                    if not (item[1] and item[2]):
-                        self.toast("全局热键被占用")
-                elif k == "step":
-                    self.nudge(item[1])
-                elif k == "value":
-                    self._accept_actual(item[1], item[2])
-                elif k == "toggle_bar":
-                    self.toggle_bar()
-                elif k == "set_default":
-                    self._reset_default()
-                elif k == "ask_default":
-                    self.ask_default()
-                elif k == "toast":
-                    self.toast(item[1])
-                elif k == "quit":
-                    self.quit()
-        except queue.Empty:
+                try:
+                    item = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                self._dispatch(item)
+        except Exception:
             pass
-        self.root.after(60, self._poll)
+        finally:
+            # 退出时（_running=False）不再重排，避免 destroy 后触发 TclError。
+            if self._running:
+                try:
+                    self.root.after(60, self._poll)
+                except Exception:
+                    pass
+
+    def _dispatch(self, item):
+        """单个队列请求的分发；异常在此隔离，不影响轮询链。"""
+        try:
+            k = item[0]
+            if k == "tid":
+                self.tid = item[1]
+            elif k == "hotkeys":
+                if not (item[1] and item[2]):
+                    self.toast("全局热键被占用")
+            elif k == "step":
+                self.nudge(item[1])
+            elif k == "value":
+                self._accept_actual(item[1], item[2])
+            elif k == "toggle_bar":
+                self.toggle_bar()
+            elif k == "set_default":
+                self._reset_default()
+            elif k == "ask_default":
+                self.ask_default()
+            elif k == "toast":
+                self.toast(item[1])
+            elif k == "quit":
+                self.quit()
+        except Exception:
+            pass
 
     # ---------------- 空闲自动隐藏 ----------------
     def poke(self):
         self._last_active = time.time()
 
     def _tick(self):
+        if not self._running:
+            return
         try:
             if (self.root.state() != "withdrawn" and not self._hover
                     and not self._menu_open
@@ -695,7 +835,12 @@ class BrightnessBar:
                 self.hide()
         except Exception:
             pass
-        self.root.after(1000, self._tick)
+        finally:
+            if self._running:
+                try:
+                    self.root.after(1000, self._tick)
+                except Exception:
+                    pass
 
     # ---------------- 显隐 ----------------
     def toggle_bar(self):
@@ -746,13 +891,30 @@ class BrightnessBar:
 
     # ---------------- 退出 ----------------
     def quit(self):
-        self._persist()
+        # 先停掉自续期，再拆资源：这样 destroy 之后不会有任何 after 回调
+        # 触发（也不会因为回调里访问已销毁的控件而抛 TclError）。
+        self._running = False
+        for job in (self._toast_job, self._commit_job):
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+        self._toast_job = None
+        self._commit_job = None
+        try:
+            self._persist()
+        except Exception:
+            pass
         self.stop_event.set()
         if self.tid:
             ctypes.WinDLL("user32", use_last_error=True).PostThreadMessageW(
                 self.tid, WM_QUIT, 0, 0)
         if self.tray:
-            self.tray.stop()
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         try:
             self.root.destroy()
         except Exception:
